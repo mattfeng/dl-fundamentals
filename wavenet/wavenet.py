@@ -64,7 +64,9 @@ class WaveNetBlock(nn.Module):
     ):
         super().__init__()
 
-        assert conv_dim % 2 == 0, "GLU requires conv_dim to be divisible by 2"
+        assert conv_dim % 2 == 0, ("GLU requires conv_dim to be "
+            "divisible by 2 (half are used as activations, and "
+            "half are used as gates)")
 
         self.dcc = DilatedCausalConv1d(
             residual_dim,
@@ -83,22 +85,52 @@ class WaveNetBlock(nn.Module):
             kernel_size=1
             )
 
-    def forward(self, seq: Float[Tensor, "batch seq channels"]):
-        seq = rearrange(seq, "b s c -> b c s")
-
+    def forward(self, seq: Float[Tensor, "batch channels seq"]):
         dcc_o = self.dcc(seq)
         glu_o = self.glu(dcc_o)
 
         resid_o = self.residual_conv(glu_o)
         skip_o = self.skip_conv(glu_o)
 
-        return resid_o, skip_o
+        return seq + resid_o, skip_o
 
 
 class WaveNet(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        vocab_size: int,
+        depth: int = 3,
+        conv_dim: int = 10,
+        residual_dim: int = 3,
+        skip_dim: int = 2,
+        head_dim: int = 4,
+    ):
         super().__init__()
-        pass
 
-    def forward(self, seq: Integer[Tensor, "batch seq channels"]):
-        pass
+        self.vocab_size = vocab_size
+        self.embed = nn.Embedding(vocab_size, residual_dim)
+        self.blocks = nn.ModuleList([
+            WaveNetBlock(2**d, conv_dim, residual_dim, skip_dim)
+            for d in range(depth)
+        ])
+        self.conv1 = nn.Conv1d(skip_dim, head_dim, kernel_size=1)
+        self.logits_conv = nn.Conv1d(head_dim, vocab_size, kernel_size=1)
+
+    def forward(self, seq: Integer[Tensor, "batch seq"]) -> Float[Tensor, "batch seq logits"]:
+        inp = self.embed(seq)
+        inp = rearrange(inp, "b s c -> b c s")
+
+        # TODO: just accumulate, don't store intermediate tensors
+        skips = []
+        for b in self.blocks:
+            inp, skip = b(inp)
+            skips.append(skip)
+
+        wavenet_o = sum(skips)
+        relu1_o = F.relu(wavenet_o)
+        conv1_o = self.conv1(relu1_o)
+        relu2_o = F.relu(conv1_o)
+        logits = self.logits_conv(relu2_o)
+        logits = rearrange(logits, "b c s -> b s c")
+
+        return logits
